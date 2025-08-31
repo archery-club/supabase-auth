@@ -76,6 +76,7 @@ func NewWechatProvider(ext conf.OAuthProviderConfiguration, scopes string) (OAut
 	}
 
 	return &WechatProvider{
+		Client: &http.Client{Timeout: defaultTimeout},
 		Config: &oauth2.Config{
 			ClientID:     ext.ClientID[0],
 			ClientSecret: ext.Secret,
