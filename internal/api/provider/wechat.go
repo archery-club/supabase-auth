@@ -220,6 +220,11 @@ func (idp WechatProvider) GetUserData(ctx context.Context, token *oauth2.Token) 
 			Name:     wechatUser.Nickname,
 			Picture:  wechatUser.Headimgurl,
 			Gender:   mapGender(wechatUser.Sex),
+
+			// To be deprecated
+			AvatarURL:  wechatUser.Headimgurl,
+			FullName:   wechatUser.Nickname,
+			ProviderId: id,
 		},
 	}
 	return &userData, nil
