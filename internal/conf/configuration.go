@@ -612,6 +612,7 @@ type SmsProviderConfiguration struct {
 	Messagebird  MessagebirdProviderConfiguration  `json:"messagebird"`
 	Textlocal    TextlocalProviderConfiguration    `json:"textlocal"`
 	Vonage       VonageProviderConfiguration       `json:"vonage"`
+	Aliyun       AliyunProviderConfiguration       `json:"aliyun"`
 }
 
 func (c *SmsProviderConfiguration) GetTestOTP(phone string, now time.Time) (string, bool) {
@@ -650,6 +651,14 @@ type VonageProviderConfiguration struct {
 	ApiKey    string `json:"api_key" split_words:"true"`
 	ApiSecret string `json:"api_secret" split_words:"true"`
 	From      string `json:"from" split_words:"true"`
+}
+
+type AliyunProviderConfiguration struct {
+	AccessKeyId     string `json:"access_key_id" split_words:"true"`
+	AccessKeySecret string `json:"access_key_secret" split_words:"true"`
+	Endpoint        string `json:"endpoint" split_words:"true"`
+	SignName        string `json:"sign_name" split_words:"true"`
+	SmsUpExtendCode string `json:"sms_up_extend_code" split_words:"true"`
 }
 
 type CaptchaConfiguration struct {
@@ -1340,6 +1349,23 @@ func (t *VonageProviderConfiguration) Validate() error {
 	}
 	if t.From == "" {
 		return errors.New("missing Vonage 'from' parameter")
+	}
+	return nil
+}
+
+func (t *AliyunProviderConfiguration) Validate() error {
+	if t.AccessKeyId == "" {
+		return errors.New("missing Aliyun Access Key ID")
+	}
+	if t.AccessKeySecret == "" {
+		return errors.New("missing Aliyun Access Key Secret")
+	}
+	if t.SignName == "" {
+		return errors.New("missing Aliyun sign name")
+	}
+	if t.Endpoint == "" {
+		// 设置默认的阿里云短信服务终端
+		t.Endpoint = "https://dysmsapi.aliyuncs.com"
 	}
 	return nil
 }
