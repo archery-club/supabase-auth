@@ -99,7 +99,7 @@ func (idp WechatProvider) AuthCodeURL(state string, args ...oauth2.AuthCodeOptio
 	return authURL
 }
 
-func (idp WechatProvider) GetOAuthToken(code string) (*oauth2.Token, error) {
+func (idp WechatProvider) GetOAuthToken(_ context.Context, code string, _ ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
 	if strings.HasPrefix(code, "wechat_oa:") {
 		token := oauth2.Token{
 			AccessToken: code,
@@ -159,6 +159,10 @@ func (idp WechatProvider) GetOAuthToken(code string) (*oauth2.Token, error) {
 	token.WithExtra(raw)
 
 	return &token, nil
+}
+
+func (idp WechatProvider) RequiresPKCE() bool {
+	return false
 }
 
 func (idp WechatProvider) GetUserData(ctx context.Context, token *oauth2.Token) (*UserProvidedData, error) {
