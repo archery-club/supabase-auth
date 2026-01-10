@@ -23,6 +23,9 @@ const (
 	ErrorCodeRefreshTokenAlreadyUsed           ErrorCode = "refresh_token_already_used"
 	ErrorCodeFlowStateNotFound                 ErrorCode = "flow_state_not_found"
 	ErrorCodeFlowStateExpired                  ErrorCode = "flow_state_expired"
+	ErrorCodeOAuthClientStateNotFound          ErrorCode = "oauth_client_state_not_found"
+	ErrorCodeOAuthClientStateExpired           ErrorCode = "oauth_client_state_expired"
+	ErrorCodeOAuthInvalidState                 ErrorCode = "oauth_invalid_state"
 	ErrorCodeSignupDisabled                    ErrorCode = "signup_disabled"
 	ErrorCodeUserBanned                        ErrorCode = "user_banned"
 	ErrorCodeProviderEmailNeedsVerification    ErrorCode = "provider_email_needs_verification"
@@ -97,4 +100,8 @@ const (
 	ErrorCodeWeb3UnsupportedChain                   ErrorCode = "web3_unsupported_chain"
 	ErrorCodeOAuthDynamicClientRegistrationDisabled ErrorCode = "oauth_dynamic_client_registration_disabled"
 	ErrorCodeEmailAddressNotProvided                ErrorCode = "email_address_not_provided"
+
+	ErrorCodeOAuthClientNotFound        ErrorCode = "oauth_client_not_found"
+	ErrorCodeOAuthAuthorizationNotFound ErrorCode = "oauth_authorization_not_found"
+	ErrorCodeOAuthConsentNotFound       ErrorCode = "oauth_consent_not_found"
 )

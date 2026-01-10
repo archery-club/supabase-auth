@@ -13,11 +13,14 @@ import (
 	"time"
 
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/gofrs/uuid"
 	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/oauthserver"
+	"github.com/supabase/auth/internal/api/shared"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
+	"github.com/supabase/auth/internal/sbff"
 	"github.com/supabase/auth/internal/security"
 	"github.com/supabase/auth/internal/utilities"
 
@@ -59,22 +62,67 @@ func (f *FunctionHooks) UnmarshalJSON(b []byte) error {
 
 var emailRateLimitCounter = observability.ObtainMetricCounter("gotrue_email_rate_limit_counter", "Number of times an email rate limit has been triggered")
 
-func (a *API) performRateLimiting(lmt *limiter.Limiter, req *http.Request) error {
-	if limitHeader := a.config.RateLimitHeader; limitHeader != "" {
-		key := req.Header.Get(limitHeader)
+func (a *API) performRateLimitingWithHeader(lmt *limiter.Limiter, req *http.Request) error {
+	limitHeader := a.config.RateLimitHeader
 
-		if key == "" {
-			log := observability.GetLogEntry(req).Entry
-			log.WithField("header", limitHeader).Warn("request does not have a value for the rate limiting header, rate limiting is not applied")
-		} else {
-			err := tollbooth.LimitByKeys(lmt, []string{key})
-			if err != nil {
-				return apierrors.NewTooManyRequestsError(apierrors.ErrorCodeOverRequestRateLimit, "Request rate limit reached")
-			}
-		}
+	// If no rate limit header was set, ignore rate limiting
+	if limitHeader == "" {
+		return nil
+	}
+
+	valuesStr := req.Header.Get(limitHeader)
+
+	// If a rate limit header was set, but has no value, ignore rate limiting but warn with an error
+	if valuesStr == "" {
+		log := observability.GetLogEntry(req).Entry
+		log.WithField("header", limitHeader).Warn("request does not have a value for the rate limiting header, rate limiting is not applied")
+
+		return nil
+	}
+
+	// According to RFC 7230 section 3.2.2, multiple headers with the same name are equivalent
+	// to a single header with that name where each value is separated by a comma and whitespace.
+	//
+	// Note that there is some ambiguity in RFC 7230 where section 3.2.4 states that
+	// header field values (which can contain commas) are processed independently of the header
+	// field name, and thus it is not always clear if a comma is a list delimiter or simply par
+	// of a single value.
+	//
+	// Given that this function is primarily for use with headers like X-Forwarded-For which
+	// vendors generally combine into comma-separated lists, we opt for the simpler approach
+	// here and split the header value by commas before taking the first value.
+	values := strings.SplitN(valuesStr, ",", 2)
+
+	// We will always get at least one value back, so this operation is safe
+	key := strings.TrimSpace(values[0])
+
+	// If the rate limit header has at least one value, but the first value is all whitespace, return a warning.
+	// This will happen if the header is something like "X-Foo-Bar: ,baz".
+	if key == "" {
+		log := observability.GetLogEntry(req).Entry
+		log.WithField("header", limitHeader).Warn("first rate limit header value is empty, rate limiting is not applied")
+
+		return nil
+	}
+
+	// Otherwise, apply rate limiting based on the first rate limit header value
+	if err := tollbooth.LimitByKeys(lmt, []string{key}); err != nil {
+		return apierrors.NewTooManyRequestsError(apierrors.ErrorCodeOverRequestRateLimit, "Request rate limit reached")
 	}
 
 	return nil
+}
+
+func (a *API) performRateLimiting(lmt *limiter.Limiter, req *http.Request) error {
+	if sbffAddr, ok := sbff.GetIPAddress(req); ok {
+		if err := tollbooth.LimitByKeys(lmt, []string{sbffAddr}); err != nil {
+			return apierrors.NewTooManyRequestsError(apierrors.ErrorCodeOverRequestRateLimit, "Request rate limit reached")
+		}
+
+		return nil
+	}
+
+	return a.performRateLimitingWithHeader(lmt, req)
 }
 
 func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
@@ -83,14 +131,14 @@ func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
 	}
 }
 
-// oauthClientAuth optionally authenticates an OAuth client as middleware
-// This doesn't fail if no client credentials are provided, but validates them if present
-func (a *API) oauthClientAuth(w http.ResponseWriter, r *http.Request) (context.Context, error) {
+// requireOAuthClientAuth authenticates an OAuth client as middleware
+// Requires client_id to be present and validates client credentials
+func (a *API) requireOAuthClientAuth(w http.ResponseWriter, r *http.Request) (context.Context, error) {
 	ctx := r.Context()
 
 	clientID, clientSecret, err := oauthserver.ExtractClientCredentials(r)
 	if err != nil {
-		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client credentials: "+err.Error())
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client credentials: %s", err.Error())
 	}
 
 	// If no client credentials provided, continue without client authentication
@@ -98,9 +146,15 @@ func (a *API) oauthClientAuth(w http.ResponseWriter, r *http.Request) (context.C
 		return ctx, nil
 	}
 
+	// Parse client_id as UUID
+	clientUUID, err := uuid.FromString(clientID)
+	if err != nil {
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client_id format")
+	}
+
 	// Validate client credentials
 	db := a.db.WithContext(ctx)
-	client, err := models.FindOAuthServerClientByClientID(db, clientID)
+	client, err := models.FindOAuthServerClientByID(db, clientUUID)
 	if err != nil {
 		if models.IsNotFoundError(err) {
 			return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client credentials")
@@ -108,13 +162,13 @@ func (a *API) oauthClientAuth(w http.ResponseWriter, r *http.Request) (context.C
 		return nil, apierrors.NewInternalServerError("Error validating client credentials").WithInternalError(err)
 	}
 
-	// Validate client secret
-	if !oauthserver.ValidateClientSecret(clientSecret, client.ClientSecretHash) {
-		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "Invalid client credentials")
+	// Validate authentication using centralized logic
+	if err := oauthserver.ValidateClientAuthentication(client, clientSecret); err != nil {
+		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "%s", err.Error())
 	}
 
 	// Add authenticated client to context
-	ctx = oauthserver.WithOAuthServerClient(ctx, client)
+	ctx = shared.WithOAuthServerClient(ctx, client)
 	return ctx, nil
 }
 

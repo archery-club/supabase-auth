@@ -104,7 +104,8 @@ type Provider interface {
 type OAuthProvider interface {
 	AuthCodeURL(string, ...oauth2.AuthCodeOption) string
 	GetUserData(context.Context, *oauth2.Token) (*UserProvidedData, error)
-	GetOAuthToken(string) (*oauth2.Token, error)
+	GetOAuthToken(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error)
+	RequiresPKCE() bool
 }
 
 func chooseHost(base, defaultHost string) string {
@@ -133,7 +134,7 @@ func makeRequest(ctx context.Context, tok *oauth2.Token, g *oauth2.Config, url s
 	res.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
-		return httpError(res.StatusCode, string(bodyBytes))
+		return httpError(res.StatusCode, "%s", string(bodyBytes))
 	}
 
 	if err := json.NewDecoder(res.Body).Decode(dst); err != nil {

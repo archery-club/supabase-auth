@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/url"
 
+	"github.com/gofrs/uuid"
 	jwt "github.com/golang-jwt/jwt/v5"
+	"github.com/supabase/auth/internal/api/shared"
 	"github.com/supabase/auth/internal/models"
 )
 
@@ -21,7 +23,6 @@ const (
 	tokenKey            = contextKey("jwt")
 	inviteTokenKey      = contextKey("invite_token")
 	signatureKey        = contextKey("signature")
-	userKey             = contextKey("user")
 	targetUserKey       = contextKey("target_user")
 	factorKey           = contextKey("factor")
 	sessionKey          = contextKey("session")
@@ -33,6 +34,7 @@ const (
 	ssoProviderKey      = contextKey("sso_provider")
 	externalHostKey     = contextKey("external_host")
 	flowStateKey        = contextKey("flow_state_id")
+	oauthClientStateKey = contextKey("oauth_client_state_id")
 )
 
 // withToken adds the JWT token to the context.
@@ -60,7 +62,7 @@ func getClaims(ctx context.Context) *AccessTokenClaims {
 
 // withUser adds the user to the context.
 func withUser(ctx context.Context, u *models.User) context.Context {
-	return context.WithValue(ctx, userKey, u)
+	return shared.WithUser(ctx, u)
 }
 
 // withTargetUser adds the target user for linking to the context.
@@ -75,14 +77,7 @@ func withFactor(ctx context.Context, f *models.Factor) context.Context {
 
 // getUser reads the user from the context.
 func getUser(ctx context.Context) *models.User {
-	if ctx == nil {
-		return nil
-	}
-	obj := ctx.Value(userKey)
-	if obj == nil {
-		return nil
-	}
-	return obj.(*models.User)
+	return shared.GetUser(ctx)
 }
 
 // getTargetUser reads the user from the context.
@@ -142,6 +137,19 @@ func getFlowStateID(ctx context.Context) string {
 		return ""
 	}
 	return obj.(string)
+}
+
+func withOAuthClientStateID(ctx context.Context, oauthClientStateID uuid.UUID) context.Context {
+	return context.WithValue(ctx, oauthClientStateKey, oauthClientStateID)
+}
+
+func getOAuthClientStateID(ctx context.Context) uuid.UUID {
+	obj := ctx.Value(oauthClientStateKey)
+	if obj == nil {
+		return uuid.Nil
+	}
+
+	return obj.(uuid.UUID)
 }
 
 func getInviteToken(ctx context.Context) string {

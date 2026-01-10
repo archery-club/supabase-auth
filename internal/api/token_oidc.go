@@ -122,7 +122,7 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		}
 
 		if !allowed {
-			return nil, false, "", nil, false, apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, fmt.Sprintf("Custom OIDC provider %q not allowed", p.Provider))
+			return nil, false, "", nil, false, apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Custom OIDC provider %q not allowed", p.Provider)
 		}
 
 		cfg = &conf.OAuthProviderConfiguration{
@@ -132,7 +132,7 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 	}
 
 	if !cfg.Enabled {
-		return nil, false, "", nil, false, apierrors.NewBadRequestError(apierrors.ErrorCodeProviderDisabled, fmt.Sprintf("Provider (issuer %q) is not enabled", issuer))
+		return nil, false, "", nil, false, apierrors.NewBadRequestError(apierrors.ErrorCodeProviderDisabled, "Provider (issuer %q) is not enabled", issuer)
 	}
 
 	oidcCtx := ctx
@@ -266,6 +266,7 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 		}
 	}
 
+	var createdUser bool
 	var token *AccessTokenResponse
 	var grantParams models.GrantParams
 
@@ -277,15 +278,17 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 		}
 	}
 
+	var user *models.User
 	if err := db.Transaction(func(tx *storage.Connection) error {
-		var user *models.User
 		var terr error
 
+		var decision models.AccountLinkingDecision
 		if params.LinkIdentity {
 			user, terr = a.linkIdentityToUser(r, ctx, tx, userData, providerType)
 		} else {
-			user, terr = a.createAccountFromExternalIdentity(tx, r, userData, providerType, emailOptional)
+			decision, user, terr = a.createAccountFromExternalIdentity(tx, r, userData, providerType, emailOptional)
 		}
+		createdUser = decision == models.CreateAccount
 		if terr != nil {
 			return terr
 		}
@@ -304,6 +307,11 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 			return err
 		default:
 			return apierrors.NewOAuthError("server_error", "Internal Server Error").WithInternalError(err)
+		}
+	}
+	if createdUser {
+		if err := a.triggerAfterUserCreated(r, db, user); err != nil {
+			return err
 		}
 	}
 

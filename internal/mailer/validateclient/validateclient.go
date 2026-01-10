@@ -1,4 +1,4 @@
-package mailer
+package validateclient
 
 import (
 	"bytes"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/mailer"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -55,10 +56,49 @@ var invalidHostMap = map[string]bool{
 
 	// Hundreds of typos per day for this.
 	"gamil.com": true,
+	"gamai.com": true,
 
 	// These are not email providers, but people often use them.
 	"anonymous.com": true,
 	"email.com":     true,
+}
+
+// We skip checking hosts for some of the biggest well known public email
+// providers, generated via:
+//
+//	test -f "gmass.html" \
+//	  || wget -O "gmass.html" https://www.gmass.co/domains
+//	cat "gmass.html" \
+//	  | pup 'div#status-details a json{}' \
+//	  | jq -r 'map([(.text | split(" "))[1], .children[0].text])
+//	      | map("`" + .[0] + ".` : true, // " + .[1]) | join("\n")' \
+//	  | sed 's| emails sent||g' \
+//	  | head -20
+//
+// Note:
+// This only affects the validateHost code, if we have an exact match we don't
+// bother to make a dns request.
+var hostAllowList = map[string]bool{
+	`gmail.com.`:     true, // 563,185,814
+	`yahoo.com.`:     true, // 107,413,999
+	`hotmail.com.`:   true, // 98,895,904
+	`aol.com.`:       true, // 31,839,178
+	`outlook.com.`:   true, // 11,826,511
+	`comcast.net.`:   true, // 9,663,112
+	`icloud.com.`:    true, // 9,274,437
+	`msn.com.`:       true, // 7,101,124
+	`hotmail.co.uk.`: true, // 5,456,609
+	`sbcglobal.net.`: true, // 5,167,305
+	`live.com.`:      true, // 5,140,589
+	`yahoo.co.in.`:   true, // 4,091,798
+	`me.com.`:        true, // 3,920,969
+	`att.net.`:       true, // 3,688,388
+	`mail.ru.`:       true, // 3,583,276
+	`bellsouth.net.`: true, // 3,455,683
+	`rediffmail.com`: true, // 3,400,300
+	`cox.net.`:       true, // 3,254,227
+	`yahoo.co.uk.`:   true, // 3,218,049
+	`verizon.net.`:   true, // 3,046,288
 }
 
 const (
@@ -77,15 +117,75 @@ var (
 	ErrInvalidEmailMX      = errors.New("invalid_email_mx")
 )
 
-type EmailValidator struct {
+// New will return a Client that first calls an email validator before passing
+// the mail along to given Client. If email validation is disabled then it
+// returns the same Client passed in mc.
+func New(globalConfig *conf.GlobalConfiguration, mc mailer.Client) mailer.Client {
+
+	// Check if email validation is enabled
+	ev := newEmailValidator(globalConfig.Mailer)
+	if ev.isEnabled() {
+		mc = &emailValidatorMailClient{ev: ev, mc: mc}
+	}
+	return mc
+}
+
+type emailValidatorMailClient struct {
+	ev *emailValidator
+	mc mailer.Client
+}
+
+// Mail implements mailer.MailClient interface by calling validate before
+// passing the mail request to the next MailClient.
+func (o *emailValidatorMailClient) Mail(
+	ctx context.Context,
+	to string,
+	subject string,
+	body string,
+	headers map[string][]string,
+	typ string,
+) error {
+	if err := o.ev.Validate(ctx, to); err != nil {
+		return err
+	}
+	return o.mc.Mail(
+		ctx,
+		to,
+		subject,
+		body,
+		headers,
+		typ,
+	)
+}
+
+type emailValidator struct {
 	extended         bool
 	serviceURL       string
 	serviceHeaders   map[string][]string
 	blockedMXRecords map[string]bool
 }
 
-func newEmailValidator(mc conf.MailerConfiguration) *EmailValidator {
-	return &EmailValidator{
+func (m *emailValidator) MailNew(
+	ctx context.Context,
+	to, subject, body string,
+	headers map[string][]string,
+	typ string,
+) error {
+	return nil
+}
+
+func (m *emailValidator) Mail(
+	ctx context.Context,
+	to, subjectTemplate, templateURL, defaultTemplate string,
+	templateData map[string]any,
+	headers map[string][]string,
+	typ string,
+) error {
+	return nil
+}
+
+func newEmailValidator(mc conf.MailerConfiguration) *emailValidator {
+	return &emailValidator{
 		extended:         mc.EmailValidationExtended,
 		serviceURL:       mc.EmailValidationServiceURL,
 		serviceHeaders:   mc.GetEmailValidationServiceHeaders(),
@@ -93,12 +193,12 @@ func newEmailValidator(mc conf.MailerConfiguration) *EmailValidator {
 	}
 }
 
-func (ev *EmailValidator) isEnabled() bool {
+func (ev *emailValidator) isEnabled() bool {
 	return ev.isExtendedEnabled() || ev.isServiceEnabled()
 }
 
-func (ev *EmailValidator) isExtendedEnabled() bool { return ev.extended }
-func (ev *EmailValidator) isServiceEnabled() bool  { return ev.serviceURL != "" }
+func (ev *emailValidator) isExtendedEnabled() bool { return ev.extended }
+func (ev *emailValidator) isServiceEnabled() bool  { return ev.serviceURL != "" }
 
 // Validate performs validation on the given email.
 //
@@ -108,7 +208,7 @@ func (ev *EmailValidator) isServiceEnabled() bool  { return ev.serviceURL != "" 
 //
 // When serviceURL AND serviceKey are non-empty strings it uses the remote
 // service to determine if the email is valid.
-func (ev *EmailValidator) Validate(ctx context.Context, email string) error {
+func (ev *emailValidator) Validate(ctx context.Context, email string) error {
 	if !ev.isEnabled() {
 		return nil
 	}
@@ -151,13 +251,19 @@ func (ev *EmailValidator) Validate(ctx context.Context, email string) error {
 
 // validateStatic will validate the format and do the static checks before
 // returning the host portion of the email.
-func (ev *EmailValidator) validateStatic(email string) (string, error) {
+func (ev *emailValidator) validateStatic(email string) (string, error) {
 	if !ev.isExtendedEnabled() {
 		return "", nil
 	}
 
 	ea, err := mail.ParseAddress(email)
 	if err != nil {
+		return "", ErrInvalidEmailFormat
+	}
+
+	// The mail package supports RFC 5322 addresses which are not valid for
+	// signup users (e.g. Chris Stockton <chris.stockton@host...>).
+	if ea.Address != email {
 		return "", ErrInvalidEmailFormat
 	}
 
@@ -189,7 +295,7 @@ func (ev *EmailValidator) validateStatic(email string) (string, error) {
 	return host, nil
 }
 
-func (ev *EmailValidator) validateService(ctx context.Context, email string) error {
+func (ev *emailValidator) validateService(ctx context.Context, email string) error {
 	if !ev.isServiceEnabled() {
 		return nil
 	}
@@ -230,13 +336,16 @@ func (ev *EmailValidator) validateService(ctx context.Context, email string) err
 		return nil
 	}
 
+	// 32 bytes is plenty for the payload: {"valid": true|false}
 	dec := json.NewDecoder(io.LimitReader(res.Body, 1<<5))
 	if err := dec.Decode(&resObject); err != nil {
 		return nil
 	}
 
-	// If the object did not contain a valid key we consider the check as
-	// failed. We _must_ get a valid JSON response with a "valid" field.
+	// If the resObject contained no "valid" key we ignore the service and
+	// return a nil error. If the Valid key is present AND set to true we
+	// will return a nil error, otherwise the valid key was present & false
+	// so we fall through to ErrInvalidEmailAddress.
 	if resObject.Valid == nil || *resObject.Valid {
 		return nil
 	}
@@ -244,7 +353,7 @@ func (ev *EmailValidator) validateService(ctx context.Context, email string) err
 	return ErrInvalidEmailAddress
 }
 
-func (ev *EmailValidator) validateProviders(name, host string) error {
+func (ev *emailValidator) validateProviders(name, host string) error {
 	switch host {
 	case "gmail.com":
 		// Based on a sample of internal data, this reduces the number of
@@ -259,7 +368,29 @@ func (ev *EmailValidator) validateProviders(name, host string) error {
 	return nil
 }
 
-func (ev *EmailValidator) validateHost(ctx context.Context, host string) error {
+// NOTE(cstockton): We could consider using[1] in the future for an additional
+// data point.
+//
+// [1] https://pkg.go.dev/golang.org/x/net/publicsuffix
+func (ev *emailValidator) validateHost(ctx context.Context, host string) error {
+
+	// As far as I know there is no such thing as valid single label hosts for
+	// email. This will block anything like: email@a, email@mycompanygltd and
+	// so on.
+	if !strings.Contains(host, ".") {
+		return ErrInvalidEmailDNS
+	}
+
+	// Require a FQDN to remove possible implict search behavior.
+	if !strings.HasSuffix(host, ".") {
+		host = host + "."
+	}
+
+	// If the host is in the allow list skip mx check all together.
+	if hostAllowList[host] {
+		return nil
+	}
+
 	mxs, err := validateEmailResolver.LookupMX(ctx, host)
 	if !isHostNotFound(err) {
 		return ev.validateMXRecords(mxs, nil)
@@ -274,7 +405,7 @@ func (ev *EmailValidator) validateHost(ctx context.Context, host string) error {
 	return ErrInvalidEmailDNS
 }
 
-func (ev *EmailValidator) validateMXRecords(mxs []*net.MX, hosts []string) error {
+func (ev *emailValidator) validateMXRecords(mxs []*net.MX, hosts []string) error {
 	for _, mx := range mxs {
 		if ev.blockedMXRecords[mx.Host] {
 			return ErrInvalidEmailMX

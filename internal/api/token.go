@@ -7,6 +7,7 @@ import (
 	"github.com/gofrs/uuid"
 
 	"github.com/supabase/auth/internal/api/apierrors"
+	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/hooks/v0hooks"
 	"github.com/supabase/auth/internal/metering"
 	"github.com/supabase/auth/internal/models"
@@ -165,11 +166,11 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 				output.Message = v0hooks.DefaultPasswordHookRejectionMessage
 			}
 			if output.ShouldLogoutUser {
-				if err := models.Logout(a.db, user.ID); err != nil {
+				if err := models.Logout(db, user.ID); err != nil {
 					return err
 				}
 			}
-			return apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, output.Message)
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeInvalidCredentials, "%s", output.Message)
 		}
 	}
 	if !isValidPassword {
@@ -190,7 +191,7 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 		}); terr != nil {
 			return terr
 		}
-		token, terr = a.tokenService.IssueRefreshToken(r, tx, user, models.PasswordGrant, grantParams)
+		token, terr = a.tokenService.IssueRefreshToken(r, w.Header(), tx, user, models.PasswordGrant, grantParams)
 		if terr != nil {
 			return terr
 		}
@@ -245,7 +246,7 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 	if err := flowState.VerifyPKCE(params.CodeVerifier); err != nil {
-		return apierrors.NewBadRequestError(apierrors.ErrorCodeBadCodeVerifier, err.Error())
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeBadCodeVerifier, "%s", err.Error())
 	}
 
 	var token *AccessTokenResponse
@@ -260,7 +261,7 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		}); terr != nil {
 			return terr
 		}
-		token, terr = a.tokenService.IssueRefreshToken(r, tx, user, authMethod, grantParams)
+		token, terr = a.tokenService.IssueRefreshToken(r, w.Header(), tx, user, authMethod, grantParams)
 		if terr != nil {
 			// error type is already handled in issueRefreshToken
 			return terr
@@ -272,7 +273,7 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 			token.ProviderRefreshToken = flowState.ProviderRefreshToken
 		}
 		if terr = tx.Destroy(flowState); terr != nil {
-			return err
+			return terr
 		}
 		return nil
 	})
@@ -287,11 +288,15 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *API) generateAccessToken(r *http.Request, tx *storage.Connection, user *models.User, sessionId *uuid.UUID, authenticationMethod models.AuthenticationMethod) (string, int64, error) {
-	return a.tokenService.GenerateAccessToken(r, tx, user, sessionId, authenticationMethod)
+	return a.tokenService.GenerateAccessToken(r, tx, tokens.GenerateAccessTokenParams{
+		User:                 user,
+		SessionID:            sessionId,
+		AuthenticationMethod: authenticationMethod,
+	})
 }
 
 func (a *API) issueRefreshToken(r *http.Request, conn *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*tokens.AccessTokenResponse, error) {
-	return a.tokenService.IssueRefreshToken(r, conn, user, authenticationMethod, grantParams)
+	return a.tokenService.IssueRefreshToken(r, make(http.Header), conn, user, authenticationMethod, grantParams)
 }
 
 func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*tokens.AccessTokenResponse, error) {
@@ -299,7 +304,8 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 	config := a.config
 	var tokenString string
 	var expiresAt int64
-	var refreshToken *models.RefreshToken
+	var issuedRefreshToken string
+
 	currentClaims := getClaims(ctx)
 	sessionId, err := uuid.FromString(currentClaims.SessionId)
 	if err != nil {
@@ -310,22 +316,57 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 		if terr := models.AddClaimToSession(tx, sessionId, authenticationMethod); terr != nil {
 			return terr
 		}
-		session, terr := models.FindSessionByID(tx, sessionId, false)
+
+		session, terr := models.FindSessionByID(tx, sessionId, true)
 		if terr != nil {
 			return terr
 		}
-		currentToken, terr := models.FindTokenBySessionID(tx, &session.ID)
-		if terr != nil {
-			return terr
-		}
+
 		if err := tx.Load(user, "Identities"); err != nil {
 			return err
 		}
-		// Swap to ensure current token is the latest one
-		refreshToken, terr = models.GrantRefreshTokenSwap(config.AuditLog, r, tx, user, currentToken)
-		if terr != nil {
-			return terr
+
+		// issue a new refresh token on successful verification
+		if session.RefreshTokenHmacKey != nil && session.RefreshTokenCounter != nil {
+			signingKey, _, terr := session.GetRefreshTokenHmacKey(config.Security.DBEncryption)
+			if terr != nil {
+				return apierrors.NewInternalServerError("Failed to get session's refresh token key").WithInternalError(terr)
+			}
+
+			// Incrementing the refresh token counter by 2 here is
+			// counter intuitive, but is important for security. It
+			// means that the previous refresh token (issued with
+			// AAL1) will no longer be able to issue AAL2 sessions.
+			// It forces the client to have received the refresh
+			// token from the MFA verification flow.
+			counter := *session.RefreshTokenCounter + 2
+			session.RefreshTokenCounter = &counter
+
+			issuedRefreshToken = (&crypto.RefreshToken{
+				Version:   0,
+				SessionID: session.ID,
+				Counter:   *session.RefreshTokenCounter,
+			}).Encode(signingKey)
+
+			if terr := session.UpdateOnlyRefreshToken(tx); terr != nil {
+				return apierrors.NewInternalServerError("Failed to update session").WithInternalError(terr)
+			}
+		} else {
+			// Legacy RTs: swap to ensure current token is the latest one
+
+			currentToken, terr := models.FindTokenBySessionID(tx, &session.ID)
+			if terr != nil {
+				return terr
+			}
+
+			refreshToken, terr := models.GrantRefreshTokenSwap(config.AuditLog, r, tx, user, currentToken)
+			if terr != nil {
+				return terr
+			}
+
+			issuedRefreshToken = refreshToken.Token
 		}
+
 		aal, _, terr := session.CalculateAALAndAMR(user)
 		if terr != nil {
 			return terr
@@ -335,7 +376,12 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 			return err
 		}
 
-		tokenString, expiresAt, terr = a.tokenService.GenerateAccessToken(r, tx, user, &session.ID, authenticationMethod)
+		tokenString, expiresAt, terr = a.tokenService.GenerateAccessToken(r, tx, tokens.GenerateAccessTokenParams{
+			User:                 user,
+			SessionID:            &session.ID,
+			AuthenticationMethod: authenticationMethod,
+		})
+
 		if terr != nil {
 			httpErr, ok := terr.(*HTTPError)
 			if ok {
@@ -353,7 +399,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 		TokenType:    "bearer",
 		ExpiresIn:    config.JWT.Exp,
 		ExpiresAt:    expiresAt,
-		RefreshToken: refreshToken.Token,
+		RefreshToken: issuedRefreshToken,
 		User:         user,
 	}, nil
 }

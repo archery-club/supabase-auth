@@ -10,11 +10,10 @@ import (
 	"strings"
 
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/sbff"
 )
 
-// GetIPAddress returns the real IP address of the HTTP request. It parses the
-// X-Forwarded-For header.
-func GetIPAddress(r *http.Request) string {
+func getIPAddressWithXFF(r *http.Request) string {
 	if r.Header != nil {
 		xForwardedFor := r.Header.Get("X-Forwarded-For")
 		if xForwardedFor != "" {
@@ -43,6 +42,15 @@ func GetIPAddress(r *http.Request) string {
 	}
 
 	return ip
+}
+
+// GetIPAddress returns the real IP address of the HTTP request.
+func GetIPAddress(r *http.Request) string {
+	if sbffAddr, ok := sbff.GetIPAddress(r); ok {
+		return sbffAddr
+	}
+
+	return getIPAddressWithXFF(r)
 }
 
 // GetBodyBytes reads the whole request body properly into a byte array.
@@ -81,6 +89,7 @@ func GetReferrer(r *http.Request, config *conf.GlobalConfiguration) string {
 }
 
 var decimalIPAddressPattern = regexp.MustCompile("^[0-9]+$")
+var regularHostname = regexp.MustCompile("^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$")
 
 func IsRedirectURLValid(config *conf.GlobalConfiguration, redirectURL string) bool {
 	if redirectURL == "" {
@@ -100,16 +109,25 @@ func IsRedirectURLValid(config *conf.GlobalConfiguration, redirectURL string) bo
 		return false
 	}
 
+	scheme := strings.TrimSuffix(strings.ToLower(refurl.Scheme), ":")
+	isHTTP := scheme == "http" || scheme == "https"
+
 	if decimalIPAddressPattern.MatchString(refurl.Hostname()) {
 		// IP address in decimal form also not allowed in redirects!
 		return false
 	} else if ip := net.ParseIP(refurl.Hostname()); ip != nil {
 		return ip.IsLoopback()
+	} else if isHTTP && !regularHostname.MatchString(refurl.Hostname()) {
+		// hostname uses characters that are not typically used
+		return false
 	}
 
 	// For case when user came from mobile app or other permitted resource - redirect back
 	for _, pattern := range config.URIAllowListMap {
-		if pattern.Match(redirectURL) {
+		// only match without the fragment
+		matchAgainst, _, _ := strings.Cut(redirectURL, "#")
+
+		if pattern.Match(matchAgainst) {
 			return true
 		}
 	}
