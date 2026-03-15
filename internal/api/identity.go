@@ -136,7 +136,7 @@ func (a *API) linkIdentityToUser(r *http.Request, ctx context.Context, tx *stora
 		return nil, terr
 	}
 
-	if targetUser.GetEmail() == "" {
+	if targetUser.GetEmail() == "" && userData.Metadata.Email != "" {
 		if terr := targetUser.UpdateUserEmailFromIdentities(tx); terr != nil {
 			if models.IsUniqueConstraintViolatedError(terr) {
 				return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeEmailExists, DuplicateEmailMsg)
